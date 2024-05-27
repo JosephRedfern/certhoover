@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use websocket::{client::ClientBuilder, OwnedMessage};
+use tungstenite::{connect, Message};
 
 const CERTSTREAM_URL: &str = "wss://certstream.calidog.io/";
 const BATCH_SIZE: usize = 1000;
@@ -23,12 +23,7 @@ async fn main() {
     // * There's a hodge-podge of thread-based and async code here... the two main Clickhouse libraries I found are
     //   both async, the websocket library /can/ be async, but I don't know enough about async in rust to know whether
     //   it's performant enough -- there can be quite a few messages coming in from the websocket.
-    // * I didn't see the docs saying that the websocket library was out no longer maintained until after I'd written
-    //   most of the code. Oops.
-    // * The websocket disconnect quite frequently, I think because we're not sending or responding to pings?
     // * I don't really know how to write idiomatic rust (yet).
-    //
-    // However, it is MY monstrosity! And it seems to mostly work!
 
     env_logger::init();
 
@@ -40,6 +35,7 @@ async fn main() {
     let batch_write_queue = Arc::clone(&batch_queue);
     let batch_read_queue = Arc::clone(&batch_queue);
 
+    // This could be a coroutine instead of a thread.
     let websocket_reader = std::thread::spawn(move || {
         read_websocket(CERTSTREAM_URL, ws_write_queue);
     });
@@ -48,11 +44,11 @@ async fn main() {
         batch_records(ws_read_queue, batch_write_queue);
     });
 
+    // Inserter is async, so we don't need a thread but do need to await it.
     insert_records(batch_read_queue).await.unwrap();
 
     websocket_reader.join().unwrap();
     batcher.join().unwrap();
-    // inserter.join().unwrap();
 }
 
 async fn insert_records(
@@ -68,6 +64,9 @@ async fn insert_records(
     let mut client = pool.get_handle().await?;
 
     loop {
+        // Rather than having to take the lock every time we check the queue, can we do something more efficient?
+        // Is there something signal based, or maybe a channel or something? It'd be nice if we could block here
+        // rather than this approach of taking the lock and sleeping a bit...
         while !batch_queue.lock().unwrap().is_empty() {
             let batch = batch_queue.lock().unwrap().pop_front().unwrap();
 
@@ -77,6 +76,10 @@ async fn insert_records(
             for record in batch.iter() {
                 match &record.data {
                     Some(data) => {
+                        // TODO: Can we avoid cloning here, and take ownership of the data?
+                        // Note: this is a bit of a mess, but none of the two Clickhouse libraries I found seem to support
+                        //       nested fields. We might be able to do some stuff with serdes to have it flatten the data
+                        //       for us, but I'm not sure how to do that yet...
                         for domain in data.leaf_cert.all_domains.iter() {
                             block.push(row!{
                                 "cert_index" => data.cert_index,
@@ -111,7 +114,7 @@ async fn insert_records(
                 inserted
             );
         }
-        // sleep a bit
+        // sleep a bit... not nice.
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -120,12 +123,18 @@ fn batch_records(
     ws_message_queue: Arc<Mutex<VecDeque<String>>>,
     batch_queue: Arc<Mutex<VecDeque<Vec<TransparencyRecord>>>>,
 ) {
+    // Pull from the websocket queue, batch up records, and shove them into the batch queue
+    // for insertion into Clickhouse.
+
+    // Would a fixed size buffer be better here? We won't always fill it but could avoid the reallocation?
     let mut message_buffer: Vec<TransparencyRecord> = Vec::new();
 
     let mut last_batch_time = std::time::Instant::now();
 
     loop {
         while !ws_message_queue.lock().unwrap().is_empty() {
+            // TODO: there's a potential race condition here if we had multiple consumers, since we're acquiring the
+            // lock once for the length check and then again to pop the message...
             let message = ws_message_queue.lock().unwrap().pop_front().unwrap();
             let record: TransparencyRecord = serde_json::from_str(&message).unwrap();
 
@@ -141,58 +150,80 @@ fn batch_records(
                 last_batch_time = std::time::Instant::now();
             }
         }
-        // sleep a bit
+        // sleep a bit... also not nice...
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn read_websocket(url: &str, queue: Arc<Mutex<VecDeque<String>>>) {
     loop {
-        let mut client = ClientBuilder::new(url)
-            .unwrap()
-            .connect_secure(None)
-            .unwrap();
+        let (mut socket, _) = match connect(url) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Error connecting to websocket: {:?}", e);
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
 
         let mut error_count: u16 = 0;
         let max_errors = 5;
 
-        for message in client.incoming_messages() {
-            let data = match message {
-                Ok(data) => {
-                    error_count = 0;
-                    data
-                }
+        let ping_interval = Duration::from_secs(5);
+        let mut last_ping_sent = std::time::Instant::now();
+
+        loop {
+            // This isn't entirely ideal, given socket.read() is blocking so we're not guaranteed to meet the ping
+            // interval, but the WS is busy enough that this doesn't matter in practice.
+
+            if last_ping_sent.elapsed() >= ping_interval {
+                info!("Sending ping");
+                socket
+                    .send(Message::Ping(vec![]))
+                    .expect("Error sending ping");
+                last_ping_sent = std::time::Instant::now();
+            }
+
+            match socket.read() {
+                Ok(msg) => match msg {
+                    Message::Text(text) => {
+                        queue.lock().unwrap().push_back(text);
+                    }
+                    Message::Close(_) => {
+                        info!("Connection closed");
+                        break;
+                    }
+                    Message::Ping(_) => {
+                        info!("Received ping");
+                        socket
+                            .send(Message::Pong(vec![]))
+                            .expect("Error sending pong");
+                    }
+                    Message::Pong(_) => {
+                        info!("Received pong");
+                    }
+                    _ => {
+                        info!("Ignoring message: {:?}", msg);
+                    }
+                },
                 Err(e) => {
                     error_count += 1;
-
                     warn!(
-                        "[{}/{}] Error processing websocket message: {}",
+                        "[{}/{}] Error reading message: {:?}",
                         error_count, max_errors, e
                     );
-                    // sleep for a bit to avoid spamming the server
-                    std::thread::sleep(Duration::from_millis(200));
-
                     if error_count >= max_errors {
-                        warn!("Too many errors, reconnecting");
+                        warn!("Too many errors, closing connection");
                         break;
-                    } else {
-                        continue;
                     }
                 }
-            };
-
-            match data {
-                OwnedMessage::Text(string) => {
-                    queue.lock().unwrap().push_back(string);
-                }
-                _ => {
-                    warn!("Received non-text message: {:?}", data);
-                }
             }
+            socket.flush().unwrap();
         }
     }
 }
 
+// TODO: expand these structs to include more data.
 #[derive(Deserialize, Debug, Clone, Serialize)]
 struct TransparencyRecordData {
     cert_index: u64,
