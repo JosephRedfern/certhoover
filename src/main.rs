@@ -81,7 +81,17 @@ async fn insert_records(
                                 "st" => data.leaf_cert.subject.st.clone().unwrap_or_default(),
                                 "aggregated" => data.leaf_cert.subject.aggregated.clone().unwrap_or_default(),
                                 "email_address" => data.leaf_cert.subject.email_address.clone().unwrap_or_default(),
-                                "domain" => domain.clone()
+                                "domain" => domain.clone(),
+                                "authority_info_access" => data.leaf_cert.extensions.authority_info_access.clone().unwrap_or_default(),
+                                "authority_key_identifier" => data.leaf_cert.extensions.authority_key_identifier.clone().unwrap_or_default(),
+                                "basic_constraints" => data.leaf_cert.extensions.basic_constraints.clone().unwrap_or_default(),
+                                "certificate_policies" => data.leaf_cert.extensions.certificate_policies.clone().unwrap_or_default(),
+                                "ctl_signed_certificate_timestamp" => data.leaf_cert.extensions.ctl_signed_certificate_timestamp.clone().unwrap_or_default(),
+                                "extended_key_usage" => data.leaf_cert.extensions.extended_key_usage.clone().unwrap_or_default(),
+                                "key_usage" => data.leaf_cert.extensions.key_usage.clone().unwrap_or_default(),
+                                "subject_alt_name" => data.leaf_cert.extensions.subject_alt_name.clone().unwrap_or_default(),
+                                "subject_key_identifier" => data.leaf_cert.extensions.subject_key_identifier.clone().unwrap_or_default(),
+                                "signature_algorithm" => data.leaf_cert.signature_algorithm.clone().unwrap_or_default(),
                             })?;
                         inserted += 1;
                     }
@@ -218,6 +228,8 @@ struct LeafCert {
     not_before: u64,
     serial_number: String,
     subject: Subject,
+    extensions: Extensions,
+    signature_algorithm: Option<String>,
 }
 #[derive(Deserialize, Debug, Clone, Serialize)]
 struct Subject {
@@ -228,5 +240,37 @@ struct Subject {
     ou: Option<String>,
     st: Option<String>,
     aggregated: Option<String>,
+
+    #[serde(alias = "emailAddress")]
     email_address: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Serialize)]
+struct Extensions {
+    #[serde(alias = "authorityInfoAccess")]
+    authority_info_access: Option<String>,
+
+    #[serde(alias = "authorityKeyIdentifier")]
+    authority_key_identifier: Option<String>,
+
+    #[serde(alias = "basicConstraints")]
+    basic_constraints: Option<String>,
+
+    #[serde(alias = "certificatePolicies")]
+    certificate_policies: Option<String>,
+
+    #[serde(alias = "ctlSignedCertificateTimestamp")]
+    ctl_signed_certificate_timestamp: Option<String>,
+
+    #[serde(alias = "extendedKeyUsage")]
+    extended_key_usage: Option<String>,
+
+    #[serde(alias = "keyUsage")]
+    key_usage: Option<String>,
+
+    #[serde(alias = "subjectAltName")]
+    subject_alt_name: Option<String>,
+
+    #[serde(alias = "subjectKeyIdentifier")]
+    subject_key_identifier: Option<String>,
 }
