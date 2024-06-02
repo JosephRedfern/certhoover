@@ -1,0 +1,33 @@
+services:
+  certhoover:
+    image: josephredfern/certhoover:latest
+    volumes:
+      - ./certs:/certs
+    environment:
+      - CERTHOOVER_CONNECTION_STRING=tcp://default:@clickhouse:9000/default
+      - RUST_LOG=info
+    healthcheck:
+      test: bash -c "[ -f /tmp/liveness ] && rm /tmp/liveness"
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 5s
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.5
+    healthcheck:
+      test: wget --tries 1 http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 30s
+      retries: 5
+      start_period: 5s
+    volumes:
+     - ch-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9009:9009"
+volumes:
+  ch-data:
