@@ -1,8 +1,13 @@
+mod settings;
+
+use settings::Settings;
+
 use clickhouse_rs::types::Block;
-use clickhouse_rs::{row, Pool};
+use clickhouse_rs::{row, ClientHandle, Pool};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::Duration;
 use tungstenite::{connect, Message};
 
@@ -21,6 +26,8 @@ async fn main() {
 
     env_logger::init();
 
+    let settings = Settings::new().unwrap();
+
     let (ws_sender, ws_receiver) = std::sync::mpsc::channel();
     let (batch_sender, batch_receiver) = std::sync::mpsc::channel();
 
@@ -34,25 +41,83 @@ async fn main() {
     });
 
     // Inserter is async, so we don't need a thread but do need to await it.
-    insert_records(batch_receiver).await.unwrap();
+    insert_records(
+        settings.connection_string,
+        batch_receiver,
+        settings.liveness_path,
+    )
+    .await
+    .unwrap();
 
     websocket_reader.join().unwrap();
     batcher.join().unwrap();
 }
 
+async fn maybe_create_table(client: &mut ClientHandle) {
+    let create_table_query = r#"
+CREATE TABLE IF NOT EXISTS certs
+(
+    `timestamp` DateTime DEFAULT now(),
+    `cert_index` UInt64,
+    `cert_link` String,
+    `domain` String,
+    `fingerprint` String,
+    `not_after` UInt64,
+    `not_before` UInt64,
+    `serial_number` String,
+    `c` String,
+    `cn` String,
+    `l` String,
+    `o` String,
+    `ou` String,
+    `st` String,
+    `aggregated` String,
+    `email_address` String,
+    `authority_info_access` String,
+    `authority_key_identifier` String,
+    `basic_constraints` String,
+    `certificate_policies` String,
+    `ctl_signed_certificate_timestamp` String,
+    `extended_key_usage` String,
+    `key_usage` String,
+    `subject_alt_name` String,
+    `subject_key_identifier` String,
+    `signature_algorithm` String
+)
+ENGINE = MergeTree
+ORDER BY (cert_index, domain, timestamp)"#;
+
+    client.execute(create_table_query).await.unwrap();
+}
+
+fn touch_file(path: &PathBuf) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&path)
+        .unwrap();
+}
+
 async fn insert_records(
+    connection_string: String,
     batch_receiver: std::sync::mpsc::Receiver<Vec<TransparencyRecord>>,
+    liveness_path: PathBuf,
 ) -> Result<(), Box<dyn Error>> {
     // Process batch of records for insertion.
     // Rather than deal with nested fields in the JSON, we flatten the data into a single row per domain.
     // This is pretty inefficient, but it's a simple way to get the data into Clickhouse, and the data is probably
     // very compressible...?
 
-    let pool = Pool::new("tcp://default:@127.0.0.1:9000/default");
+    let pool = Pool::new(connection_string);
 
     let mut client = pool.get_handle().await?;
 
+    maybe_create_table(&mut client).await;
+
     loop {
+        // Update liveness file
+        touch_file(&liveness_path);
+
         let batch = batch_receiver.recv().unwrap(); //TODO: handle error
 
         let mut block = Block::new();
